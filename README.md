@@ -27,8 +27,10 @@ We recommend using a virtual environment:
 ```bash
 git clone https://github.com/fashn-AI/fashn-vton-1.5.git
 cd fashn-vton-1.5
+## for local PC or custom server
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
+
 ```
 
 **Note:** Installation includes `onnxruntime-gpu` for GPU-accelerated pose detection. Ensure CUDA is properly configured on your system. For CPU-only environments, replace with the CPU version:
