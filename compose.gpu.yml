@@ -1,0 +1,25 @@
+services:
+  vton:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      VTON_WEIGHTS_DIR: /app/weights
+      HF_HOME: /cache/huggingface
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - vton-weights:/app/weights
+      - hf-cache:/cache/huggingface
+    gpus: all
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+volumes:
+  vton-weights:
+  hf-cache:
