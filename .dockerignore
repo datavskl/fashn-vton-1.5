@@ -1,0 +1,13 @@
+.git
+.venv
+.env
+.env.*
+__pycache__
+.pytest_cache
+test_outputs
+weights
+outputs
+*.safetensors
+*.onnx
+*.pt
+*.pth
