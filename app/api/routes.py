@@ -81,7 +81,7 @@ async def submit_job(
 ):
     inputs = await _collect(person_image, garment_image, upper_garment_image, lower_garment_image,
                             category, garment_photo_type, num_timesteps, guidance_scale, seed, segmentation_free)
-    jobs._purgejobs._jobs()
+    jobs._purge_jobs()
     if jobs._job_queue is None:
         raise HTTPException(503, "Worker not running")
     if jobs._job_queue.full():
@@ -94,7 +94,7 @@ async def submit_job(
 
 @router.get("/api/v1/jobs/{job_id}", dependencies=[Depends(_authenticate)])
 async def get_job(job_id: str):
-    jobs._purgejobs._jobs()
+    jobs._purge_jobs()
     job = jobs._jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found or expired")
