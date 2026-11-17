@@ -1,413 +1,313 @@
-# backend_api.py
-import numpy as np
-from PIL import Image
-import io
+"""Secure, single-GPU FastAPI service for FASHN VTON v1.5.
+
+One application process / one GPU worker is supported. Run uvicorn with --workers 1.
+"""
+import asyncio
 import base64
-import platform
-from typing import Optional
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+import io
+import logging
+import os
+import secrets
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Literal
+
+import torch
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import torch
-from huggingface_hub import hf_hub_download
-import os
+from PIL import Image, ImageOps, UnidentifiedImageError
 
-# Import preprocessing utilities
 from image_preprocessing import ImagePreprocessor
 
-# ----------------- CONFIG ----------------- #
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WEIGHTS_DIR = os.path.join(SCRIPT_DIR, "weights")
-
-CATEGORIES = ["tops", "bottoms", "one-pieces"]
-GARMENT_PHOTO_TYPES = ["model", "flat-lay"]
-
-# Image preprocessing settings
-MAX_RESOLUTION_1K = 2000  # For Try-On v1.5/v1.6
-JPEG_QUALITY = 95
-
-# Global preprocessor instance
-image_preprocessor = ImagePreprocessor(max_resolution=MAX_RESOLUTION_1K)
-
-
-# ----------------- HELPERS ----------------- #
-
-def download_weights():
-    """Download model weights from HuggingFace Hub."""
-    os.makedirs(WEIGHTS_DIR, exist_ok=True)
-    dwpose_dir = os.path.join(WEIGHTS_DIR, "dwpose")
-    os.makedirs(dwpose_dir, exist_ok=True)
-
-    # Download TryOnModel weights
-    tryon_path = os.path.join(WEIGHTS_DIR, "model.safetensors")
-    if not os.path.exists(tryon_path):
-        print("Downloading TryOnModel weights...")
-        hf_hub_download(
-            repo_id="fashn-ai/fashn-vton-1.5",
-            filename="model.safetensors",
-            local_dir=WEIGHTS_DIR,
-        )
-
-    # Download DWPose models
-    dwpose_files = ["yolox_l.onnx", "dw-ll_ucoco_384.onnx"]
-    for filename in dwpose_files:
-        filepath = os.path.join(dwpose_dir, filename)
-        if not os.path.exists(filepath):
-            print(f"Downloading DWPose/{filename}...")
-            hf_hub_download(
-                repo_id="fashn-ai/DWPose",
-                filename=filename,
-                local_dir=dwpose_dir,
-            )
-
-    print("Weights downloaded successfully!")
-
-
-def image_to_base64(image: Image.Image) -> str:
-    """Convert PIL Image to base64 string."""
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    return img_str
-
-
-def numpy_to_base64(array: np.ndarray) -> str:
-    """Convert numpy array to base64 string."""
-    image = Image.fromarray(array.astype('uint8'))
-    return image_to_base64(image)
-
-
-# ----------------- FASHN VTON PREDICTOR ----------------- #
-
-class FashnVTONPredictor(object):
-    def __init__(self):
-        """Initialize the FASHN VTON predictor."""
-        # Check CUDA availability
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available. This service requires a GPU.")
-
-        # ---------------------------------- Diagnostics ---------------------------------- #
-        print(f"Python           : {platform.python_version()}")
-        print(f"PyTorch          : {torch.__version__}")
-        print(f" • built for CUDA : {torch.version.cuda}")
-        if torch.backends.cudnn.is_available():
-            print(f" • built for cuDNN: {torch.backends.cudnn.version()}")
-        print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            dev = torch.cuda.current_device()
-            cc = torch.cuda.get_device_capability(dev)
-            print(f"GPU {dev}: {torch.cuda.get_device_name(dev)} (compute {cc[0]}.{cc[1]})")
-
-        # Enable TF32 for faster computation on Ampere+ GPUs
-        if torch.cuda.get_device_properties(0).major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-
-        print("Downloading weights (if needed)...")
-        download_weights()
-
-        print("Loading pipeline...")
-        from fashn_vton import TryOnPipeline
-
-        self.pipeline = TryOnPipeline(weights_dir=WEIGHTS_DIR, device="cuda")
-        print("Pipeline loaded on CUDA!")
-
-    def process_virtual_tryon(
-        self,
-        person_image: Image.Image,
-        garment_image: Image.Image,
-        category: str = "tops",
-        garment_photo_type: str = "model",
-        num_timesteps: int = 50,
-        guidance_scale: float = 1.5,
-        seed: int = 42,
-        segmentation_free: bool = True,
-    ):
-        """Process virtual try-on inference."""
-        # Handle seed (guard against None or invalid values)
-        if seed is None or seed < 0:
-            seed = 42
-
-        # Convert to RGB if needed
-        if person_image.mode != "RGB":
-            person_image = person_image.convert("RGB")
-        if garment_image.mode != "RGB":
-            garment_image = garment_image.convert("RGB")
-
-        # Run inference
-        result = self.pipeline(
-            person_image=person_image,
-            garment_image=garment_image,
-            category=category,
-            garment_photo_type=garment_photo_type,
-            num_samples=1,
-            num_timesteps=num_timesteps,
-            guidance_scale=guidance_scale,
-            seed=int(seed),
-            segmentation_free=segmentation_free,
-        )
-
-        return result.images[0]
-
-
-# ----------------- FASTAPI APP ----------------- #
-
-app = FastAPI(
-    title="FASHN VTON API",
-    description="API for virtual try-on using FASHN VTON v1.5 model",
-    version="1.5.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+LOG = logging.getLogger("shrivastra.vton")
+CATEGORIES = {"tops", "bottoms", "one-pieces"}
+PHOTO_TYPES = {"model", "flat-lay"}
+MAX_UPLOAD_BYTES = int(os.getenv("VTON_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+MAX_IMAGE_PIXELS = int(os.getenv("VTON_MAX_IMAGE_PIXELS", "20000000"))
+QUEUE_SIZE = int(os.getenv("VTON_QUEUE_SIZE", "20"))
+JOB_TTL_SECONDS = int(os.getenv("VTON_JOB_TTL_SECONDS", "86400"))
+API_TOKEN = os.getenv("VTON_API_TOKEN", "")
+ALLOWED_ORIGINS = [value.strip() for value in os.getenv("VTON_CORS_ORIGINS", "").split(",") if value.strip()]
+WEIGHTS_DIR = os.getenv("VTON_WEIGHTS_DIR", os.path.join(os.path.dirname(__file__), "weights"))
+preprocessor = ImagePreprocessor(max_resolution=2000)
 predictor = None
+_gpu_lock = asyncio.Lock()
+_jobs: dict[str, "Job"] = {}
+_job_queue: asyncio.Queue | None = None
+_worker_task: asyncio.Task | None = None
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the predictor on startup."""
+@dataclass
+class Job:
+    id: str
+    created_at: float
+    status: str = "queued"
+    result: str | None = None
+    error: str | None = None
+    completed_at: float | None = None
+    inputs: tuple = field(default_factory=tuple, repr=False)
+
+
+def _purge_jobs():
+    now = time.time()
+    for job_id, job in list(_jobs.items()):
+        if job.completed_at is not None and now - job.completed_at > JOB_TTL_SECONDS:
+            del _jobs[job_id]
+
+
+def _authenticate(request: Request):
+    # Fail closed if no server-side token has been configured.
+    if not API_TOKEN:
+        raise HTTPException(status_code=503, detail="API authentication is not configured")
+    auth = request.headers.get("authorization", "")
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(token, API_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Bearer"})
+
+
+def _validate(category: str, garment_photo_type: str, num_timesteps: int, guidance_scale: float):
+    if category not in CATEGORIES:
+        raise HTTPException(422, "Invalid category")
+    if garment_photo_type not in PHOTO_TYPES:
+        raise HTTPException(422, "Invalid garment_photo_type")
+    if not 10 <= num_timesteps <= 50:
+        raise HTTPException(422, "num_timesteps must be between 10 and 50")
+    if not 1.0 <= guidance_scale <= 3.0:
+        raise HTTPException(422, "guidance_scale must be between 1.0 and 3.0")
+
+
+async def _image_upload(upload: UploadFile) -> Image.Image:
+    if upload.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(415, "Only JPEG, PNG and WebP images are accepted")
+    data = await upload.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "Image upload exceeds size limit")
+    try:
+        with Image.open(io.BytesIO(data)) as probe:
+            if probe.format not in {"JPEG", "PNG", "WEBP"}:
+                raise HTTPException(415, "Unsupported image encoding")
+            if probe.width * probe.height > MAX_IMAGE_PIXELS:
+                raise HTTPException(413, "Image dimensions exceed pixel limit")
+            probe.verify()
+        with Image.open(io.BytesIO(data)) as opened:
+            image = ImageOps.exif_transpose(opened)
+            image.load()
+            # Force RGB before JPEG conversion; preserve proper alpha compositing.
+            result, _ = preprocessor.preprocess(image)
+            return result.copy()
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise HTTPException(422, "Invalid image content") from exc
+    finally:
+        await upload.close()
+
+
+def _download_weights():
+    from huggingface_hub import hf_hub_download
+    os.makedirs(os.path.join(WEIGHTS_DIR, "dwpose"), exist_ok=True)
+    for repo_id, filename, subdir in [
+        ("fashn-ai/fashn-vton-1.5", "model.safetensors", WEIGHTS_DIR),
+        ("fashn-ai/DWPose", "yolox_l.onnx", os.path.join(WEIGHTS_DIR, "dwpose")),
+        ("fashn-ai/DWPose", "dw-ll_ucoco_384.onnx", os.path.join(WEIGHTS_DIR, "dwpose")),
+    ]:
+        if not os.path.isfile(os.path.join(subdir, filename)):
+            hf_hub_download(repo_id=repo_id, filename=filename, local_dir=subdir)
+
+
+def _get_predictor():
     global predictor
-    predictor = FashnVTONPredictor()
-    print("✅ FASHN VTON Predictor initialized successfully")
+    if predictor is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("GPU unavailable")
+        _download_weights()
+        from fashn_vton import TryOnPipeline
+        predictor = TryOnPipeline(weights_dir=WEIGHTS_DIR, device="cuda")
+    return predictor
+
+
+def _run_inference(person, upper, lower, category, photo_type, steps, guidance, seed, segmentation_free):
+    pipeline = _get_predictor()
+    current = person
+    tasks = [(upper, category)] if upper is not None else []
+    if lower is not None:
+        tasks.append((lower, "bottoms"))
+    for garment, selected_category in tasks:
+        result = pipeline(
+            person_image=current, garment_image=garment, category=selected_category,
+            garment_photo_type=photo_type, num_samples=1, num_timesteps=steps,
+            guidance_scale=guidance, seed=seed, segmentation_free=segmentation_free,
+        )
+        current = result.images[0]
+    buffer = io.BytesIO()
+    current.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+async def _infer(inputs):
+    async with _gpu_lock:
+        return await asyncio.to_thread(_run_inference, *inputs)
+
+
+async def _job_worker():
+    assert _job_queue is not None
+    while True:
+        job_id = await _job_queue.get()
+        try:
+            job = _jobs.get(job_id)
+            if job:
+                job.status = "processing"
+                try:
+                    job.result = await _infer(job.inputs)
+                    job.status = "completed"
+                except Exception:
+                    LOG.exception("Inference failed for job %s", job.id)
+                    job.error = "Inference failed; check server logs"
+                    job.status = "failed"
+                finally:
+                    job.inputs = ()
+                    job.completed_at = time.time()
+        finally:
+            _job_queue.task_done()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _job_queue, _worker_task
+    _job_queue = asyncio.Queue(maxsize=QUEUE_SIZE)
+    _worker_task = asyncio.create_task(_job_worker())
+    try:
+        yield
+    finally:
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            pass
+        _worker_task = None
+        _job_queue = None
+
+
+app = FastAPI(title="ShriVastra FASHN VTON API", version="1.5.1", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False, allow_methods=["GET", "POST"], allow_headers=["Authorization", "Content-Type"],
+)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "running", "gpu_available": torch.cuda.is_available(),
+            "model_loaded": predictor is not None}
 
 
 @app.get("/")
 async def root():
-    """Root endpoint with API information."""
-    return {
-        "message": "FASHN VTON API",
-        "status": "running",
-        "version": "1.5.0",
-        "endpoints": {
-            "health": "/health",
-            "docs": "/docs",
-            "virtual_tryon": "/api/v1/virtual-tryon",
-            "virtual_tryon_separate": "/api/v1/virtual-tryon-separate"
-        }
-    }
+    return {"name": "ShriVastra FASHN VTON API", "docs": "/docs", "health": "/health"}
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "model_loaded": predictor is not None,
-        "gpu_available": torch.cuda.is_available()
-    }
+async def _collect(person_image, garment_image, upper_garment_image, lower_garment_image,
+                   category, garment_photo_type, num_timesteps, guidance_scale, seed, segmentation_free):
+    _validate(category, garment_photo_type, num_timesteps, guidance_scale)
+    if garment_image is not None and (upper_garment_image is not None or lower_garment_image is not None):
+        raise HTTPException(422, "Choose single garment or upper/lower garments")
+    if garment_image is None and upper_garment_image is None and lower_garment_image is None:
+        raise HTTPException(422, "At least one garment is required")
+    person = await _image_upload(person_image)
+    upper = await _image_upload(garment_image or upper_garment_image) if garment_image or upper_garment_image else None
+    lower = await _image_upload(lower_garment_image) if lower_garment_image else None
+    return (person, upper, lower, category, garment_photo_type, num_timesteps,
+            guidance_scale, seed, segmentation_free)
 
 
-@app.post("/api/v1/virtual-tryon")
+@app.post("/api/v1/jobs", status_code=202, dependencies=[Depends(_authenticate)])
+async def submit_job(
+    person_image: UploadFile = File(...),
+    garment_image: UploadFile | None = File(None),
+    upper_garment_image: UploadFile | None = File(None),
+    lower_garment_image: UploadFile | None = File(None),
+    category: Literal["tops", "bottoms", "one-pieces"] = Form("tops"),
+    garment_photo_type: Literal["model", "flat-lay"] = Form("model"),
+    num_timesteps: int = Form(50, ge=10, le=50),
+    guidance_scale: float = Form(1.5, ge=1.0, le=3.0),
+    seed: int = Form(42, ge=0),
+    segmentation_free: bool = Form(True),
+):
+    inputs = await _collect(person_image, garment_image, upper_garment_image, lower_garment_image,
+                            category, garment_photo_type, num_timesteps, guidance_scale, seed, segmentation_free)
+    _purge_jobs()
+    if _job_queue is None:
+        raise HTTPException(503, "Worker not running")
+    if _job_queue.full():
+        raise HTTPException(429, "Inference queue is full", headers={"Retry-After": "10"})
+    job = Job(id=str(uuid.uuid4()), created_at=time.time(), inputs=inputs)
+    _jobs[job.id] = job
+    _job_queue.put_nowait(job.id)
+    return {"job_id": job.id, "status": job.status, "status_url": f"/api/v1/jobs/{job.id}"}
+
+
+@app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(_authenticate)])
+async def get_job(job_id: str):
+    _purge_jobs()
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found or expired")
+    return {"job_id": job.id, "status": job.status, "generated_image": job.result,
+            "error": job.error}
+
+
+# Keep the existing endpoints and response format working for old clients.
+# Calls are serialized through the same GPU lock as asynchronous jobs.
+@app.post("/api/v1/virtual-tryon", dependencies=[Depends(_authenticate)])
 async def virtual_tryon(
-    person_image: UploadFile = File(..., description="Person image file"),
-    garment_image: UploadFile = File(..., description="Garment image file"),
-    category: str = Form("tops", description="Garment category: tops, bottoms, one-pieces"),
-    garment_photo_type: str = Form("model", description="Photo type: model, flat-lay"),
-    num_timesteps: int = Form(50, description="Number of sampling steps (10-50)"),
-    guidance_scale: float = Form(1.5, description="Guidance scale (1.0-3.0)"),
-    seed: int = Form(42, description="Random seed for reproducibility"),
-    segmentation_free: bool = Form(True, description="Use segmentation-free mode"),
+    person_image: UploadFile = File(...),
+    garment_image: UploadFile = File(...),
+    category: Literal["tops", "bottoms", "one-pieces"] = Form("tops"),
+    garment_photo_type: Literal["model", "flat-lay"] = Form("model"),
+    num_timesteps: int = Form(50, ge=10, le=50),
+    guidance_scale: float = Form(1.5, ge=1.0, le=3.0),
+    seed: int = Form(42, ge=0),
+    segmentation_free: bool = Form(True),
 ):
-    """
-    Virtual try-on endpoint (single garment).
-    
-    Returns the generated try-on image as base64 encoded PNG.
-    """
-    if predictor is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
+    inputs = await _collect(person_image, garment_image, None, None, category, garment_photo_type,
+                            num_timesteps, guidance_scale, seed, segmentation_free)
     try:
-        # Validate inputs
-        if num_timesteps < 10 or num_timesteps > 50:
-            raise HTTPException(status_code=400, detail="num_timesteps must be between 10 and 50")
-        
-        if guidance_scale < 1.0 or guidance_scale > 3.0:
-            raise HTTPException(status_code=400, detail="guidance_scale must be between 1.0 and 3.0")
-        
-        if category not in CATEGORIES:
-            raise HTTPException(status_code=400, detail=f"Invalid category. Must be one of {CATEGORIES}")
-        
-        if garment_photo_type not in GARMENT_PHOTO_TYPES:
-            raise HTTPException(status_code=400, detail=f"Invalid garment_photo_type. Must be one of {GARMENT_PHOTO_TYPES}")
-        
-        # Load images
-        person_img = Image.open(io.BytesIO(await person_image.read()))
-        garment_img = Image.open(io.BytesIO(await garment_image.read()))
-        
-        # Preprocess images according to FASHN best practices
-        # 1. Resize to max 2000px (maintaining aspect ratio)
-        # 2. Convert to JPEG with quality 95
-        # 3. Use LANCZOS resampling for quality preservation
-        person_img, person_metadata = image_preprocessor.preprocess(person_img)
-        garment_img, garment_metadata = image_preprocessor.preprocess(garment_img)
-        
-        print(f"Person image preprocessed: {person_metadata.get('resized', False)}, "
-              f"size: {person_metadata.get('final_size')}")
-        print(f"Garment image preprocessed: {garment_metadata.get('resized', False)}, "
-              f"size: {garment_metadata.get('final_size')}")
-        
-        # Process virtual try-on
-        generated_image = predictor.process_virtual_tryon(
-            person_image=person_img,
-            garment_image=garment_img,
-            category=category,
-            garment_photo_type=garment_photo_type,
-            num_timesteps=num_timesteps,
-            guidance_scale=guidance_scale,
-            seed=seed,
-            segmentation_free=segmentation_free,
-        )
-        
-        # Return response
-        response = {
-            "success": True,
-            "generated_image": image_to_base64(generated_image),
-            "parameters": {
-                "category": category,
-                "garment_photo_type": garment_photo_type,
-                "num_timesteps": num_timesteps,
-                "guidance_scale": guidance_scale,
-                "seed": seed,
-                "segmentation_free": segmentation_free
-            }
-        }
-        
-        return JSONResponse(content=response)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        result = await _infer(inputs)
+    except Exception:
+        LOG.exception("Synchronous inference failed")
+        raise HTTPException(503, "Inference unavailable")
+    return {"success": True, "generated_image": result,
+            "parameters": {"category": category, "garment_photo_type": garment_photo_type,
+                           "num_timesteps": num_timesteps, "guidance_scale": guidance_scale,
+                           "seed": seed, "segmentation_free": segmentation_free}}
 
 
-@app.post("/api/v1/virtual-tryon-separate")
+@app.post("/api/v1/virtual-tryon-separate", dependencies=[Depends(_authenticate)])
 async def virtual_tryon_separate(
-    person_image: UploadFile = File(..., description="Person image file"),
-    upper_garment_image: Optional[UploadFile] = File(None, description="Upper garment image (optional)"),
-    lower_garment_image: Optional[UploadFile] = File(None, description="Lower garment image (optional)"),
-    garment_photo_type: str = Form("model", description="Photo type: model, flat-lay"),
-    num_timesteps: int = Form(50, description="Number of sampling steps (10-50)"),
-    guidance_scale: float = Form(1.5, description="Guidance scale (1.0-3.0)"),
-    seed: int = Form(42, description="Random seed for reproducibility"),
-    segmentation_free: bool = Form(True, description="Use segmentation-free mode"),
+    person_image: UploadFile = File(...),
+    upper_garment_image: UploadFile | None = File(None),
+    lower_garment_image: UploadFile | None = File(None),
+    garment_photo_type: Literal["model", "flat-lay"] = Form("model"),
+    num_timesteps: int = Form(50, ge=10, le=50),
+    guidance_scale: float = Form(1.5, ge=1.0, le=3.0),
+    seed: int = Form(42, ge=0),
+    segmentation_free: bool = Form(True),
 ):
-    """
-    Virtual try-on endpoint with separate upper and lower garments.
-    
-    Supports:
-    - Upper garment only (tops)
-    - Lower garment only (bottoms)
-    - Both garments (complete outfit - processed sequentially)
-    
-    At least one garment must be provided.
-    """
-    if predictor is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
+    inputs = await _collect(person_image, None, upper_garment_image, lower_garment_image,
+                            "tops", garment_photo_type, num_timesteps, guidance_scale, seed, segmentation_free)
     try:
-        # Validate at least one garment is provided
-        if upper_garment_image is None and lower_garment_image is None:
-            raise HTTPException(
-                status_code=400, 
-                detail="At least one garment (upper or lower) must be provided"
-            )
-        
-        # Validate inputs
-        if num_timesteps < 10 or num_timesteps > 50:
-            raise HTTPException(status_code=400, detail="num_timesteps must be between 10 and 50")
-        
-        if guidance_scale < 1.0 or guidance_scale > 3.0:
-            raise HTTPException(status_code=400, detail="guidance_scale must be between 1.0 and 3.0")
-        
-        if garment_photo_type not in GARMENT_PHOTO_TYPES:
-            raise HTTPException(status_code=400, detail=f"Invalid garment_photo_type. Must be one of {GARMENT_PHOTO_TYPES}")
-        
-        # Load person image
-        person_img = Image.open(io.BytesIO(await person_image.read()))
-        
-        # Preprocess person image
-        person_img, person_metadata = image_preprocessor.preprocess(person_img)
-        print(f"Person image preprocessed: {person_metadata.get('resized', False)}, "
-              f"size: {person_metadata.get('final_size')}")
-        
-        # Process garments
-        current_result = person_img
-        processing_steps = []
-        preprocessing_info = {'person': person_metadata}
-        
-        # Process upper garment if provided
-        if upper_garment_image is not None:
-            upper_img = Image.open(io.BytesIO(await upper_garment_image.read()))
-            
-            # Preprocess upper garment
-            upper_img, upper_metadata = image_preprocessor.preprocess(upper_img)
-            preprocessing_info['upper_garment'] = upper_metadata
-            print(f"Upper garment preprocessed: {upper_metadata.get('resized', False)}, "
-                  f"size: {upper_metadata.get('final_size')}")
-            
-            current_result = predictor.process_virtual_tryon(
-                person_image=current_result,
-                garment_image=upper_img,
-                category="tops",
-                garment_photo_type=garment_photo_type,
-                num_timesteps=num_timesteps,
-                guidance_scale=guidance_scale,
-                seed=seed,
-                segmentation_free=segmentation_free,
-            )
-            
-            processing_steps.append("upper_garment")
-        
-        # Process lower garment if provided
-        if lower_garment_image is not None:
-            lower_img = Image.open(io.BytesIO(await lower_garment_image.read()))
-            
-            # Preprocess lower garment
-            lower_img, lower_metadata = image_preprocessor.preprocess(lower_img)
-            preprocessing_info['lower_garment'] = lower_metadata
-            print(f"Lower garment preprocessed: {lower_metadata.get('resized', False)}, "
-                  f"size: {lower_metadata.get('final_size')}")
-            
-            current_result = predictor.process_virtual_tryon(
-                person_image=current_result,
-                garment_image=lower_img,
-                category="bottoms",
-                garment_photo_type=garment_photo_type,
-                num_timesteps=num_timesteps,
-                guidance_scale=guidance_scale,
-                seed=seed,
-                segmentation_free=segmentation_free,
-            )
-            
-            processing_steps.append("lower_garment")
-        
-        # Return response
-        response = {
-            "success": True,
-            "generated_image": image_to_base64(current_result),
-            "processing_steps": processing_steps,
-            "preprocessing": preprocessing_info,
-            "parameters": {
-                "garment_photo_type": garment_photo_type,
-                "num_timesteps": num_timesteps,
-                "guidance_scale": guidance_scale,
-                "seed": seed,
-                "segmentation_free": segmentation_free,
-                "garments_processed": len(processing_steps)
-            }
-        }
-        
-        return JSONResponse(content=response)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        result = await _infer(inputs)
+    except Exception:
+        LOG.exception("Synchronous inference failed")
+        raise HTTPException(503, "Inference unavailable")
+    stages = [s for s, value in [("upper_garment", upper_garment_image), ("lower_garment", lower_garment_image)] if value]
+    return {"success": True, "generated_image": result, "processing_steps": stages,
+            "parameters": {"garment_photo_type": garment_photo_type, "num_timesteps": num_timesteps,
+                           "guidance_scale": guidance_scale, "seed": seed,
+                           "segmentation_free": segmentation_free, "garments_processed": len(stages)}}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("backend_api:app", host="127.0.0.1", port=8000, workers=1)
