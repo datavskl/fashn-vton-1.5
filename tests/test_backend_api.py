@@ -19,10 +19,12 @@ def files():
 
 @pytest.fixture()
 def client(monkeypatch):
-    import backend_api as api
-    monkeypatch.setattr(api, "API_TOKEN", "test-secret")
-    monkeypatch.setattr(api, "_run_inference", lambda *args: "mock-image")
-    with TestClient(api.app) as c:
+    from app.main import app
+    from app.core import config
+    from app.services import inference
+    monkeypatch.setattr(config, "API_TOKEN", "test-secret")
+    monkeypatch.setattr(inference, "_run_inference", lambda *args: "mock-image")
+    with TestClient(app) as c:
         yield c
 
 
@@ -45,8 +47,8 @@ def test_invalid_auth(client):
 
 
 def test_unconfigured_auth_fails_closed(client, monkeypatch):
-    import backend_api as api
-    monkeypatch.setattr(api, "API_TOKEN", "")
+    from app.core import config
+    monkeypatch.setattr(config, "API_TOKEN", "")
     assert client.post("/api/v1/jobs", files=files(), headers=HEADERS).status_code == 503
 
 
@@ -75,8 +77,8 @@ def test_reject_corrupt_image(client):
 
 
 def test_reject_oversize_image(client, monkeypatch):
-    import backend_api as api
-    monkeypatch.setattr(api, "MAX_UPLOAD_BYTES", 20)
+    from app.api import routes
+    monkeypatch.setattr(routes, "MAX_UPLOAD_BYTES", 20)
     assert client.post("/api/v1/jobs", files=files(), headers=HEADERS).status_code == 413
 
 
