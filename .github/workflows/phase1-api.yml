@@ -4,8 +4,9 @@ on:
   push:
     branches:
       - develop/shrivastra-vton-backend
+      - refactor/shrivastra-single-backend
   pull_request:
-    branches: [main]
+    branches: [main, develop/shrivastra-vton-backend]
 
 jobs:
   api-tests:
