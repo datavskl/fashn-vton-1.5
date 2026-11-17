@@ -47,7 +47,7 @@ def run_case(client, url, token, person, garment_fields, case, timeout, outdir):
             opened = [(name, path.open("rb")) for name, path in garment_fields.items()]
             try:
                 payload = {"person_image": (person.name, person_file, "image/jpeg")}
-                for name, (path, stream) in zip(garment_fields, opened):
+                for (name, path), (_, stream) in zip(garment_fields.items(), opened):
                     mime = "image/png" if path.suffix.lower() == ".png" else (
                         "image/webp" if path.suffix.lower() == ".webp" else "image/jpeg")
                     payload[name] = (path.name, stream, mime)
@@ -78,8 +78,10 @@ def run_case(client, url, token, person, garment_fields, case, timeout, outdir):
             format_name = image.format
         outdir.mkdir(parents=True, exist_ok=True)
         (outdir / f"{case}.png").write_bytes(image_bytes)
+        samples = [m for m in observation if m is not None]
         return {"case": case, "status": "passed", "latency_seconds": elapsed,
-                "output_size": size, "format": format_name, "job_id": job_id}
+                "output_size": size, "format": format_name, "job_id": job_id,
+                "observed_peak_gpu_used_mib": max(samples) if samples else None}
     finally:
         stop.set()
         observer.join(timeout=2)
