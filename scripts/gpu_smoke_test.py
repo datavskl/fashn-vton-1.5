@@ -17,6 +17,11 @@ from PIL import Image
 from io import BytesIO
 
 
+def image_mime(path):
+    return {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".webp": "image/webp"}.get(path.suffix.lower(), "application/octet-stream")
+
+
 def gpu_memory_mib():
     """Report max used-memory MiB across visible NVIDIA GPUs; None if unavailable."""
     try:
@@ -46,10 +51,9 @@ def run_case(client, url, token, person, garment_fields, case, timeout, outdir):
         with person.open("rb") as person_file:
             opened = [(name, path.open("rb")) for name, path in garment_fields.items()]
             try:
-                payload = {"person_image": (person.name, person_file, "image/jpeg")}
+                payload = {"person_image": (person.name, person_file, image_mime(person))}
                 for (name, path), (_, stream) in zip(garment_fields.items(), opened):
-                    mime = "image/png" if path.suffix.lower() == ".png" else (
-                        "image/webp" if path.suffix.lower() == ".webp" else "image/jpeg")
+                    mime = image_mime(path)
                     payload[name] = (path.name, stream, mime)
                 response = client.post(f"{url}/api/v1/jobs", files=payload, headers=headers)
                 response.raise_for_status()
@@ -107,6 +111,8 @@ def main():
     for path in (args.person, args.top, args.bottom):
         if path is not None and not path.is_file():
             parser.error(f"File not found: {path}")
+        if path is not None and image_mime(path) == "application/octet-stream":
+            parser.error(f"Unsupported image extension: {path}")
     cases = []
     if args.top:
         cases.append(("top", {"garment_image": args.top}))
