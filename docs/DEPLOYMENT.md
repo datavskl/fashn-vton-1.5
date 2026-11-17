@@ -1,4 +1,7 @@
-# ShriVastra FASHN VTON v1.5 — Phase 1 Deployment
+# ShriVastra FASHN VTON v1.5 — Single modular FastAPI backend
+
+Entry point: `app/main.py` (`uvicorn app.main:app`). The original FASHN AI inference model remains in `src/fashn_vton/`. The Gradio `app.py` is a separate optional demo, not a production backend.
+
 
 This backend is intended for a **single GPU and one Uvicorn worker**.
 GPU inference has not yet been verified on a target host. It requires a CUDA-capable NVIDIA GPU.
@@ -28,7 +31,7 @@ Store the token in a protected environment or secret manager, not in the reposit
 
 Example: `export VTON_CORS_ORIGINS="https://your-store.example"`.
 
-Run: `uvicorn backend_api:app --host 127.0.0.1 --port 8000 --workers 1`.
+Run: `uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1`.
 
 Deploy behind an HTTPS reverse proxy (such as Nginx). Configure a request body cap (e.g.
 `client_max_body_size 25m`), network firewall, authentication on upstream applications,
