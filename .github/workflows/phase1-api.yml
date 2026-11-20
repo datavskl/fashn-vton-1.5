@@ -4,8 +4,9 @@ on:
   push:
     branches:
       - develop/shrivastra-vton-backend
+      - refactor/shrivastra-single-backend
   pull_request:
-    branches: [main]
+    branches: [main, develop/shrivastra-vton-backend]
 
 jobs:
   api-tests:
@@ -21,7 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "fastapi>=0.110,<1" "httpx>=0.27,<1" "pytest>=8,<10" "pillow>=10,<13" "python-multipart>=0.0.9,<1"
       - name: Compile API source
-        run: python -m py_compile backend_api.py image_preprocessing.py scripts/gpu_smoke_test.py tests/test_backend_api.py tests/conftest.py
+        run: python -m py_compile app/main.py app/api/routes.py app/core/security.py app/core/config.py app/services/inference.py app/services/preprocessing.py app/services/jobs.py scripts/gpu_smoke_test.py tests/test_backend_api.py tests/conftest.py
       - name: Check WordPress integration syntax
         run: php -l wordpress/shrivastra-vton-bridge/shrivastra-vton-bridge.php
       - name: Run API contract tests

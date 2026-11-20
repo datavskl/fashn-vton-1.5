@@ -4,7 +4,7 @@
 
 - Linux host with a compatible NVIDIA GPU, functional driver, Docker, Docker Compose, and NVIDIA Container Toolkit.
 - Test `nvidia-smi` on host and `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`.
-- Check out develop/shrivastra-vton-backend. Leave main untouched.
+- Check out refactor/shrivastra-single-backend (the canonical-backend branch). Leave main untouched.
 - Generate a long random server token: `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`.
 - Create a private root `.env` with `VTON_API_TOKEN=<random token>` and `VTON_CORS_ORIGINS=https://your-store.example`.
 

@@ -1,50 +1,9 @@
-# FastAPI and server
+# ShriVastra FastAPI runtime dependencies.
+# The FASHN model and CUDA/PyTorch dependencies are defined in pyproject.toml.
+# Install the local model package first: pip install -e .
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+python-multipart>=0.0.9,<1
 
-# Core Framework
-fastapi
-uvicorn[standard]
-python-multipart
-
-# Async & Concurrency
-aiofiles
-redis
-
-# Image Processing
-Pillow
-
-# ML/AI
-torch
-torchvision
-huggingface-hub
-
-# VTON Model (adjust based on actual package)
-# fashn-vton==1.5.0  # Uncomment if package exists on PyPI
-
-# API Documentation
-pydantic
-pydantic-settings
-
-# Rate Limiting
-slowapi
-
-# Monitoring & Logging
-prometheus-client
-python-json-logger
-
-# Security
-python-jose[cryptography]
-passlib[bcrypt]
-
-# Environment Management
-python-dotenv
-
-# Cloud Storage (optional)
-#boto3==1.34.34  # For AWS S3
-#google-cloud-storage==2.14.0  # For GCS
-
-# Development
-pytest
-pytest-asyncio
-httpx
-black
-ruff
+# Optional for the on-host GPU smoke-test script and API contract tests:
+# pip install -r requirements-dev.txt

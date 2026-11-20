@@ -1,4 +1,7 @@
-# ShriVastra FASHN VTON v1.5 — Phase 1 Deployment
+# ShriVastra FASHN VTON v1.5 — Single modular FastAPI backend
+
+Entry point: `app/main.py` (`uvicorn app.main:app`). The original FASHN AI inference model remains in `src/fashn_vton/`. The Gradio `app.py` is a separate optional demo, not a production backend.
+
 
 This backend is intended for a **single GPU and one Uvicorn worker**.
 GPU inference has not yet been verified on a target host. It requires a CUDA-capable NVIDIA GPU.
@@ -7,7 +10,7 @@ GPU inference has not yet been verified on a target host. It requires a CUDA-cap
 
 1. Use Python 3.10–3.12, preferably 3.11, and a GPU-compatible PyTorch install.
 2. Create a virtual environment and install the model package: `pip install -e .`
-3. Install backend dependencies: `pip install -r requirements.txt`
+3. Install backend dependencies: `pip install -r requirements.txt` (or `pip install -r requirements-dev.txt` for tests and smoke scripts).
 4. Download model weights: `python scripts/download_weights.py --weights-dir ./weights`
 5. Validate CUDA installation using `nvidia-smi` and `python -c "import torch; print(torch.cuda.is_available())"`.
 
@@ -28,7 +31,7 @@ Store the token in a protected environment or secret manager, not in the reposit
 
 Example: `export VTON_CORS_ORIGINS="https://your-store.example"`.
 
-Run: `uvicorn backend_api:app --host 127.0.0.1 --port 8000 --workers 1`.
+Run: `uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1`.
 
 Deploy behind an HTTPS reverse proxy (such as Nginx). Configure a request body cap (e.g.
 `client_max_body_size 25m`), network firewall, authentication on upstream applications,
